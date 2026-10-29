@@ -32,7 +32,12 @@
 #ifdef __WIN32__
 #include <wx/msw/wrapwin.h>
 #endif
+#ifdef __WXGTK__
+#include <wx/eventfilter.h>
+#include <gtk/gtk.h>
+#endif
 
+#include <functional>
 #include <unordered_map>
 
 namespace Slic3r::GUI {
@@ -539,6 +544,26 @@ void set_row(wxSizer *sizer, Label *t, const wxString &s, const wxColour &fg, co
     }
     sizer->Show(t, has, true);
 }
+
+#ifdef __WXGTK__
+// Sees every event the app processes and forwards it to the card; never consumes anything.
+// The card is a plain (non-grabbing) wxPopupWindow, so on GTK the only built-in dismiss is the
+// row's leave/motion handling. This filter adds what a tooltip is expected to honour on top of
+// that: a click or wheel anywhere else, a key press (Escape), and the app losing focus.
+class DismissFilter : public wxEventFilter
+{
+public:
+    explicit DismissFilter(std::function<void(const wxEvent &)> on_event) : m_on_event(std::move(on_event)) {}
+    int FilterEvent(wxEvent &evt) override
+    {
+        m_on_event(evt);
+        return Event_Skip;
+    }
+
+private:
+    std::function<void(const wxEvent &)> m_on_event;
+};
+#endif
 } // namespace
 
 // ----------------------------------------------------------------------------
@@ -577,10 +602,17 @@ ParamTooltip::ParamTooltip() : wxPopupWindow(wxGetApp().mainframe, wxBORDER_NONE
         update_shadow(e.IsShown());
         e.Skip();
     });
+#ifdef __WXGTK__
+    m_dismiss_filter = std::make_unique<DismissFilter>([this](const wxEvent &evt) { on_app_event(evt); });
+    wxEvtHandler::AddFilter(m_dismiss_filter.get());
+#endif
 }
 
 ParamTooltip::~ParamTooltip()
 {
+#ifdef __WXGTK__
+    if (m_dismiss_filter) wxEvtHandler::RemoveFilter(m_dismiss_filter.get()); // before any member it calls into goes away
+#endif
     if (s_self == this) s_self = nullptr; // never leave the singleton pointer dangling if the frame destroys us as its child
     delete m_timer;
     delete m_copy_timer;
@@ -915,6 +947,13 @@ bool ParamTooltip::DoShowFor(const std::string &opt_key, const std::string &wiki
         return false;
     }
 
+    // Dismissed by a click/key/focus loss: stay down while the pointer is still on the same label,
+    // otherwise the next motion event would pop the card straight back up.
+    if (m_dismissed) {
+        if (opt_key == m_last_key) return true;
+        m_dismissed = false;
+    }
+
     const bool dark = wxGetApp().dark_mode();
 
     const ConfigOptionDef *def      = print_config_def.get(opt_key);
@@ -973,11 +1012,63 @@ void ParamTooltip::DoHide(bool now)
     }
 }
 
+bool ParamTooltip::pointer_over_card() const
+{
+#ifdef __WXGTK3__
+    // Ask GDK which of our windows is under the pointer instead of comparing wxGetMousePosition()
+    // with the card rect. The app always runs on the X11 backend (CLI::run forces GDK_BACKEND=x11),
+    // so on a Wayland session this is XWayland, where the X pointer position is frozen at its last
+    // spot inside an X window once the pointer crosses onto a native Wayland surface. Polling those
+    // stale coordinates keeps re-arming the hide and leaves the card up over other windows.
+    // XWayland does move the X sprite to the root window in that case (xwl_xy_to_window), so a
+    // window lookup is right there and on plain X11 alike.
+    GtkWidget *widget = static_cast<GtkWidget *>(GetHandle());
+    GdkWindow *card   = widget ? gtk_widget_get_window(widget) : nullptr;
+    if (card == nullptr) return false;
+    GdkDevice *pointer = gdk_seat_get_pointer(gdk_display_get_default_seat(gdk_window_get_display(card)));
+    GdkWindow *under   = pointer ? gdk_device_get_window_at_position(pointer, nullptr, nullptr) : nullptr;
+    return under != nullptr && gdk_window_get_toplevel(under) == card;
+#else
+    return GetClientRect().Contains(ScreenToClient(wxGetMousePosition()));
+#endif
+}
+
+#ifdef __WXGTK__
+void ParamTooltip::on_app_event(const wxEvent &evt)
+{
+    // Nothing on screen and no show pending: the common case, keep it cheap.
+    if (!IsShown() && (m_hide || !m_timer->IsRunning())) return;
+
+    const wxEventType type    = evt.GetEventType();
+    bool              dismiss = false;
+    if (type == wxEVT_LEFT_DOWN || type == wxEVT_MIDDLE_DOWN || type == wxEVT_RIGHT_DOWN || type == wxEVT_AUX1_DOWN ||
+        type == wxEVT_AUX2_DOWN || type == wxEVT_MOUSEWHEEL) {
+        // Clicks on the card's own controls (Wiki link, copy icon) must keep it open.
+        dismiss = true;
+        for (const wxWindow *w = wxDynamicCast(evt.GetEventObject(), wxWindow); w != nullptr; w = w->GetParent())
+            if (w == this) {
+                dismiss = false;
+                break;
+            }
+    } else if (type == wxEVT_CHAR_HOOK || type == wxEVT_KEY_DOWN) {
+        dismiss = true; // any key, Escape included, like a native GTK tooltip
+    } else if (type == wxEVT_ACTIVATE_APP) {
+        // App-level, not per-frame wxEVT_ACTIVATE: a click on a focusable child of the card moves
+        // GTK focus into the popup and deactivates the frame, which must not count as focus loss.
+        dismiss = !static_cast<const wxActivateEvent &>(evt).GetActive();
+    }
+    if (!dismiss) return;
+
+    m_dismissed = true;
+    m_timer->Stop(); // also cancels a show that is still waiting out SHOW_DELAY_MS
+    DoHide(true);
+}
+#endif
+
 void ParamTooltip::OnTimer(wxTimerEvent &)
 {
     if (m_hide) {
-        wxPoint mp = ScreenToClient(wxGetMousePosition());
-        if (GetClientRect().Contains(mp)) {
+        if (pointer_over_card()) {
             m_timer->StartOnce(HIDE_DELAY_MS);
             return;
         }
@@ -1036,7 +1127,10 @@ wxString ParamTooltip::ItemTooltip(const std::string &opt_key, const std::string
 
 void ParamTooltip::Hide()
 {
-    if (s_self) s_self->DoHide(false);
+    if (s_self) {
+        s_self->m_dismissed = false; // the pointer left the label: the next hover may show the card again
+        s_self->DoHide(false);
+    }
 }
 
 void ParamTooltip::Shutdown()

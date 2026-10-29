@@ -5,12 +5,14 @@
 #include <wx/bitmap.h>
 #include <wx/image.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "WindowShadow.hpp"
 
 class Label;
+class wxEventFilter;
 class wxStaticText;
 class wxStaticBitmap;
 class wxSizer;
@@ -82,6 +84,12 @@ private:
 
     bool DoShowFor(const std::string &opt_key, const std::string &wiki_path, const wxPoint &tip_pos, const wxString &line_label, const wxString &line_tooltip);
     void DoHide(bool now);
+    // True while the pointer is over the card itself (keeps a pending hide from closing it).
+    bool pointer_over_card() const;
+#ifdef __WXGTK__
+    // App-wide event filter hook: hide the card on a click/wheel outside it, any key, or focus loss.
+    void on_app_event(const wxEvent &evt);
+#endif
 
     /**
      * \brief Play the "copied!" confirmation on the copy icon: crossfade to a check mark, hold, fade back.
@@ -141,6 +149,13 @@ private:
     int      m_copy_step = 0;
 
     WindowShadow m_shadow; // soft drop shadow behind the card (Figma-spec defaults)
+
+    // Set when the card was dismissed by a click/key/focus loss rather than by the pointer leaving
+    // the row; the card then stays down for m_last_key until the row calls Hide() (pointer moved off).
+    bool m_dismissed = false;
+#ifdef __WXGTK__
+    std::unique_ptr<wxEventFilter> m_dismiss_filter; // registered for the card's lifetime
+#endif
 };
 
 } // namespace Slic3r::GUI
